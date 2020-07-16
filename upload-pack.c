@@ -88,6 +88,7 @@ struct upload_pack_data {
 	enum allow_uor allow_uor;
 
 	struct list_objects_filter_options filter_options;
+	struct string_list allowed_filters;
 
 	struct packet_writer writer;
 
@@ -103,6 +104,8 @@ struct upload_pack_data {
 	unsigned no_progress : 1;
 	unsigned use_include_tag : 1;
 	unsigned allow_filter : 1;
+	unsigned allow_filter_fallback : 1;
+	unsigned long tree_filter_max_depth;
 
 	unsigned done : 1;					/* v2 only */
 	unsigned allow_ref_in_want : 1;				/* v2 only */
@@ -120,6 +123,7 @@ static void upload_pack_data_init(struct upload_pack_data *data)
 	struct string_list deepen_not = STRING_LIST_INIT_DUP;
 	struct string_list uri_protocols = STRING_LIST_INIT_DUP;
 	struct object_array extra_edge_obj = OBJECT_ARRAY_INIT;
+	struct string_list allowed_filters = STRING_LIST_INIT_DUP;
 
 	memset(data, 0, sizeof(*data));
 	data->symref = symref;
@@ -131,6 +135,9 @@ static void upload_pack_data_init(struct upload_pack_data *data)
 	data->deepen_not = deepen_not;
 	data->uri_protocols = uri_protocols;
 	data->extra_edge_obj = extra_edge_obj;
+	data->allowed_filters = allowed_filters;
+	data->allow_filter_fallback = 1;
+	data->tree_filter_max_depth = ULONG_MAX;
 	packet_writer_init(&data->writer, 1);
 
 	data->keepalive = 5;
@@ -147,6 +154,7 @@ static void upload_pack_data_clear(struct upload_pack_data *data)
 	string_list_clear(&data->deepen_not, 0);
 	object_array_clear(&data->extra_edge_obj);
 	list_objects_filter_release(&data->filter_options);
+	string_list_clear(&data->allowed_filters, 1);
 
 	free((char *)data->pack_objects_hook);
 }
@@ -984,6 +992,67 @@ static int process_deepen_not(const char *line, struct string_list *deepen_not, 
 	return 0;
 }
 
+static int allows_filter_choice(struct upload_pack_data *data,
+				struct list_objects_filter_options *opts)
+{
+	const char *key = list_object_filter_config_name(opts->choice);
+	struct string_list_item *item = string_list_lookup(&data->allowed_filters,
+							   key);
+	int allowed = -1;
+	if (item)
+		allowed = (intptr_t) item->util;
+
+	if (allowed != 0 &&
+	    opts->choice == LOFC_TREE_DEPTH &&
+	    opts->tree_exclude_depth > data->tree_filter_max_depth)
+		return 0;
+
+	if (allowed > -1)
+		return allowed;
+	return data->allow_filter_fallback;
+}
+
+static struct list_objects_filter_options *banned_filter(
+	struct upload_pack_data *data,
+	struct list_objects_filter_options *opts)
+{
+	size_t i;
+
+	if (!allows_filter_choice(data, opts))
+		return opts;
+
+	if (opts->choice == LOFC_COMBINE)
+		for (i = 0; i < opts->sub_nr; i++) {
+			struct list_objects_filter_options *sub = &opts->sub[i];
+			if (banned_filter(data, sub))
+				return sub;
+		}
+	return NULL;
+}
+
+static void die_if_using_banned_filter(struct upload_pack_data *data)
+{
+	struct list_objects_filter_options *banned = banned_filter(data,
+								   &data->filter_options);
+	struct strbuf buf = STRBUF_INIT;
+	if (!banned)
+		return;
+
+	strbuf_addf(&buf, _("filter '%s' not supported"),
+		    list_object_filter_config_name(banned->choice));
+	if (banned->choice == LOFC_TREE_DEPTH &&
+	    data->tree_filter_max_depth != ULONG_MAX)
+		strbuf_addf(&buf, _(" (maximum depth: %lu, but got: %lu)"),
+			    data->tree_filter_max_depth,
+			    banned->tree_exclude_depth);
+
+	packet_writer_error(&data->writer, "%s\n", buf.buf);
+
+	strbuf_release(&buf);
+
+	die(_("git upload-pack: banned object filter requested"));
+}
+
 static void receive_needs(struct upload_pack_data *data,
 			  struct packet_reader *reader)
 {
@@ -1014,6 +1083,7 @@ static void receive_needs(struct upload_pack_data *data,
 				die("git upload-pack: filtering capability not negotiated");
 			list_objects_filter_die_if_populated(&data->filter_options);
 			parse_list_objects_filter(&data->filter_options, arg);
+			die_if_using_banned_filter(data);
 			continue;
 		}
 
@@ -1171,6 +1241,37 @@ static int find_symref(const char *refname, const struct object_id *oid,
 	return 0;
 }
 
+static void parse_object_filter_config(const char *var, const char *value,
+				       struct upload_pack_data *data)
+{
+	struct strbuf spec = STRBUF_INIT;
+	const char *sub, *key;
+	size_t sub_len;
+
+	if (parse_config_key(var, "uploadpack", &sub, &sub_len, &key))
+		return;
+	if (!sub || !skip_prefix(sub, "filter.", &sub))
+		return;
+
+	if (sub != key)
+		strbuf_add(&spec, sub, key - sub - 1);
+	strbuf_tolower(&spec);
+
+	if (!strcmp(key, "allow")) {
+		if (spec.len)
+			string_list_insert(&data->allowed_filters, spec.buf)->util =
+				(void *)(intptr_t)git_config_bool(var, value);
+		else
+			data->allow_filter_fallback = git_config_bool(var, value);
+	} else if (!strcmp(spec.buf, "tree") && !strcmp(key, "maxdepth")) {
+		string_list_insert(&data->allowed_filters, "tree")->util
+			= (void *) (intptr_t) 1;
+		data->tree_filter_max_depth = git_config_ulong(var, value);
+	}
+
+	strbuf_release(&spec);
+}
+
 static int upload_pack_config(const char *var, const char *value, void *cb_data)
 {
 	struct upload_pack_data *data = cb_data;
@@ -1209,6 +1310,8 @@ static int upload_pack_config(const char *var, const char *value, void *cb_data)
 		if (!strcmp("uploadpack.packobjectshook", var))
 			return git_config_string(&data->pack_objects_hook, var, value);
 	}
+
+	parse_object_filter_config(var, value, data);
 
 	return parse_hide_refs_config(var, value, "uploadpack");
 }
@@ -1390,6 +1493,7 @@ static void process_args(struct packet_reader *request,
 		if (data->allow_filter && skip_prefix(arg, "filter ", &p)) {
 			list_objects_filter_die_if_populated(&data->filter_options);
 			parse_list_objects_filter(&data->filter_options, p);
+			die_if_using_banned_filter(data);
 			continue;
 		}
 
